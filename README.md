@@ -67,6 +67,11 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
+## SMTP Provider Setup
+
+Configuring a mailbox in the web app (iCloud, Gmail, **privateemail.com**, custom):
+see [docs/smtp-providers.md](docs/smtp-providers.md).
+
 ## Tech Stack
 
 | Layer | Tech |
