@@ -4,20 +4,28 @@ import { sendToBackground } from '../lib/messaging';
 import type { ExtensionSettings } from '../lib/storage';
 import type { Contact } from '../lib/csv-parser';
 import DOMPurify from 'dompurify';
+import { parsePhoneNumberFromString } from 'libphonenumber-js/min';
 
 type LogEntry = { recipient: string; status: 'success' | 'error' | 'skipped'; message?: string };
 type SendingStatus = 'idle' | 'sending' | 'cooldown' | 'completed';
 
 const DEFAULT_SETTINGS: ExtensionSettings = {
   defaultMode: 'email',
-  delayPreset: 'normal',
-  customDelaySeconds: 10,
+  delayPreset: 'stealth',
+  customDelaySeconds: 90,
   jitterEnabled: true,
-  batchSize: 10,
-  cooldownSeconds: 60,
+  batchSize: 50,
+  cooldownSeconds: 300,
   dailyLimit: 200,
   spinSyntaxEnabled: true,
+  zeroWidthEnabled: true,
+  typingSimulation: true,
   sidebarPosition: 'right',
+  coldContactCap: 50,
+  timeOfDayWarn: true,
+  prejobWarmupPing: false,
+  longTermAccount: false,
+  classificationEnabled: true,
 };
 
 export default function App() {
@@ -44,6 +52,20 @@ export default function App() {
   const [errorBanner, setErrorBanner] = useState('');
   const [preflight, setPreflight] = useState<{ ready: boolean; failures: string[] } | null>(null);
   const [haltedJob, setHaltedJob] = useState<{ sent: number; total: number; error: string } | null>(null);
+  type ExtractMode = 'current-group' | 'pick-group' | 'all-chats';
+  type ExtractedRow = { phone: string; name: string; source: string };
+  type GroupOption = { id: string; name: string; size: number };
+  const [extractMode, setExtractMode] = useState<ExtractMode>('current-group');
+  const [extracting, setExtracting] = useState(false);
+  const [extracted, setExtracted] = useState<ExtractedRow[]>([]);
+  const [groupList, setGroupList] = useState<GroupOption[]>([]);
+  const [pickedGroupId, setPickedGroupId] = useState('');
+  const [extractMsg, setExtractMsg] = useState('');
+  // Anti-ban v2 state
+  const [warmupState, setWarmupState] = useState<{ cap: number; warmupDay: number; warmupCap: number; bypassed: boolean } | null>(null);
+  const [banLock, setBanLock] = useState<{ active: boolean; remainingMs: number; reason: string } | null>(null);
+  const [jobHeader, setJobHeader] = useState<{ warmCount: number; coldCount: number; total: number; effectiveCap: number; warmupDay: number; warmupBypassed: boolean } | null>(null);
+  const [softCapModal, setSoftCapModal] = useState<{ coldCount: number; cap: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cooldownRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -79,6 +101,15 @@ export default function App() {
     }
 
     window.parent.postMessage({ type: 'PREFLIGHT_CHECK' }, '*');
+
+    if (initialMode === 'whatsapp') {
+      sendToBackground<{ cap: number; warmupDay: number; warmupCap: number; bypassed: boolean }>('GET_WARMUP_STATE')
+        .then(setWarmupState)
+        .catch(() => {});
+      sendToBackground<{ active: boolean; remainingMs: number; reason: string }>('GET_BAN_LOCK')
+        .then(setBanLock)
+        .catch(() => {});
+    }
   }, []);
 
   // Listen for progress events from content script
@@ -93,6 +124,9 @@ export default function App() {
       } else if (data.type === 'JOB_START_ERROR') {
         setErrorBanner(`Failed to start job: ${data.error}`);
         setStatus('idle');
+      } else if (data.type === 'JOB_HEADER') {
+        const h = data as unknown as { warmCount: number; coldCount: number; total: number; effectiveCap: number; warmupDay: number; warmupBypassed: boolean };
+        setJobHeader(h);
       } else if (data.type === 'BULK_SENDER_PROGRESS') {
         const { current, total, sent, failed, status: st, recipient, error } = data as unknown as {
           current: number; total: number; sent: number; failed: number;
@@ -120,6 +154,42 @@ export default function App() {
             return prev - 1;
           });
         }, 1000);
+      } else if (data.type === 'EXTRACT_RESULT') {
+        const { mode: rmode, success, contacts: extractedRows, groups, unresolved, total, error } = data as unknown as {
+          mode?: 'current-group' | 'list-groups' | 'pick-group' | 'all-chats';
+          success: boolean;
+          contacts?: ExtractedRow[];
+          groups?: GroupOption[];
+          unresolved?: number;
+          total?: number;
+          error?: string;
+        };
+        setExtracting(false);
+        if (!success) {
+          setExtractMsg('');
+          setErrorBanner(error || 'Extraction failed');
+          return;
+        }
+        if (rmode === 'list-groups') {
+          const list = groups ?? [];
+          setGroupList(list);
+          if (list.length === 0) setExtractMsg('No groups found.');
+          else setExtractMsg(`Loaded ${list.length} groups — pick one below.`);
+          return;
+        }
+        const rows = extractedRows ?? [];
+        setExtracted(rows);
+        if (rows.length === 0) {
+          if (typeof unresolved === 'number' && unresolved > 0) {
+            setExtractMsg(`0 of ${total ?? unresolved} resolved — all participants are in WhatsApp privacy mode (open dev console for diagnostics).`);
+          } else {
+            setExtractMsg('No phone numbers found.');
+          }
+        } else if (typeof unresolved === 'number' && unresolved > 0) {
+          setExtractMsg(`${rows.length} contacts found — ${unresolved} skipped (privacy mode, no phone available)`);
+        } else {
+          setExtractMsg(`${rows.length} contacts found`);
+        }
       } else if (data.type === 'BULK_SENDER_COMPLETE') {
         const { sent, failed, skipped, halted, error } = data as unknown as {
           sent: number; failed: number; skipped: number; halted?: boolean; error?: string;
@@ -131,6 +201,12 @@ export default function App() {
         }
         sendToBackground<{ sent: number; limit: number }>('GET_DAILY_COUNT')
           .then(setDailyCount)
+          .catch(() => {});
+        sendToBackground<{ cap: number; warmupDay: number; warmupCap: number; bypassed: boolean }>('GET_WARMUP_STATE')
+          .then(setWarmupState)
+          .catch(() => {});
+        sendToBackground<{ active: boolean; remainingMs: number; reason: string }>('GET_BAN_LOCK')
+          .then(setBanLock)
           .catch(() => {});
       }
     }
@@ -190,23 +266,51 @@ export default function App() {
   // Sanitize preview for display
   const safePreview = DOMPurify.sanitize(resolvedPreview);
 
-  function startJob() {
-    if (contacts.length === 0) { setErrorBanner('Please upload a CSV first.'); return; }
-    if (mode === 'email' && !subject) { setErrorBanner('Please enter a subject line.'); return; }
-    if (mode === 'email' && !emailColumn) { setErrorBanner('Please select which column contains email addresses.'); return; }
-    if (mode === 'whatsapp' && !phoneColumn) { setErrorBanner('Please select which column contains phone numbers.'); return; }
+  function launchJob(mapped: Contact[]) {
     setErrorBanner('');
     setStatus('sending');
     setLogs([]);
     setSummary(null);
-    setProgress({ current: 0, total: contacts.length, sent: 0, failed: 0 });
-
-    const mapped = mapContacts(contacts);
+    setJobHeader(null);
+    setProgress({ current: 0, total: mapped.length, sent: 0, failed: 0 });
     if (mode === 'email') {
       window.parent.postMessage({ type: 'START_EMAIL_JOB', contacts: mapped, template, subject, settings }, '*');
     } else {
       window.parent.postMessage({ type: 'START_WA_JOB', contacts: mapped, template, settings }, '*');
     }
+  }
+
+  function startJob() {
+    if (contacts.length === 0) { setErrorBanner('Please upload a CSV first.'); return; }
+    if (mode === 'email' && !subject) { setErrorBanner('Please enter a subject line.'); return; }
+    if (mode === 'email' && !emailColumn) { setErrorBanner('Please select which column contains email addresses.'); return; }
+    if (mode === 'whatsapp' && !phoneColumn) { setErrorBanner('Please select which column contains phone numbers.'); return; }
+
+    // Ban-lock guard (UI side — content script also enforces)
+    if (mode === 'whatsapp' && banLock?.active) {
+      const hours = Math.ceil((banLock.remainingMs ?? 0) / (60 * 60 * 1000));
+      setErrorBanner(`Account is locked from sending (~${hours}h remaining). ${banLock.reason || ''}`);
+      return;
+    }
+
+    // Cold-contact soft cap warning. Best-effort: we can't classify before sending
+    // (that requires the bridge), so we show the warning based on the worst case
+    // (treat all CSV contacts as cold) when classification is enabled. The actual
+    // accurate count appears in the JOB_HEADER after the job starts.
+    if (mode === 'whatsapp' && settings.classificationEnabled) {
+      const projectedCold = contacts.length; // worst case; real number shown in JOB_HEADER
+      if (projectedCold > settings.coldContactCap && !softCapModal) {
+        setSoftCapModal({ coldCount: projectedCold, cap: settings.coldContactCap });
+        return;
+      }
+    }
+
+    launchJob(mapContacts(contacts));
+  }
+
+  function isOutsideBusinessHours(): boolean {
+    const h = new Date().getHours();
+    return h < 9 || h >= 21;
   }
 
   function cancelJob() {
@@ -239,6 +343,86 @@ export default function App() {
       <div style={{ background: '#171717', padding: '6px 16px', fontSize: '12px', borderBottom: '1px solid #262626', color: '#71717a' }}>
         Today: <b style={{ color: '#a1a1aa' }}>{dailyCount.sent}</b> / {dailyCount.limit} messages sent
       </div>
+
+      {/* Warmup status (WhatsApp only) */}
+      {mode === 'whatsapp' && warmupState && !warmupState.bypassed && warmupState.warmupCap !== Infinity && (
+        <div style={{ background: '#1f2937', color: '#93c5fd', padding: '6px 16px', fontSize: '11px', borderBottom: '1px solid #262626' }}>
+          Warmup day {warmupState.warmupDay} of 14 — daily cap <b>{warmupState.cap}</b> (ramps up automatically)
+        </div>
+      )}
+      {mode === 'whatsapp' && warmupState && warmupState.bypassed && (
+        <div style={{ background: '#171717', color: '#71717a', padding: '4px 16px', fontSize: '11px', borderBottom: '1px solid #262626' }}>
+          Warmup ramp bypassed (long-term account)
+        </div>
+      )}
+
+      {/* Ban-lock panel — replaces send section when active */}
+      {mode === 'whatsapp' && banLock?.active && (
+        <div style={{ background: 'rgba(255, 59, 48, 0.15)', color: '#ff8a80', padding: '12px 16px', borderBottom: '1px solid #7f1d1d' }}>
+          <div style={{ fontWeight: 600, marginBottom: '4px', color: '#ff3b30' }}>
+            Account paused — ban-like signal detected
+          </div>
+          <div style={{ fontSize: '12px', marginBottom: '8px', color: '#fca5a5' }}>
+            {banLock.reason || 'Sends were not acknowledged by WhatsApp.'}
+          </div>
+          <div style={{ fontSize: '11px', marginBottom: '8px', color: '#a1a1aa' }}>
+            Send is disabled for ~{Math.ceil((banLock.remainingMs ?? 0) / (60 * 60 * 1000))}h. Don't retry — it makes restrictions stick longer.
+          </div>
+          <button
+            onClick={() => {
+              if (!confirm('Only clear if you have waited at least 24 hours and verified the account is not banned. Continuing now may permanently restrict the account. Proceed?')) return;
+              sendToBackground('CLEAR_BAN_FLAG').then(() => {
+                setBanLock({ active: false, remainingMs: 0, reason: '' });
+              }).catch(() => setErrorBanner('Failed to clear ban flag'));
+            }}
+            style={{ padding: '4px 12px', background: 'transparent', color: '#ff8a80', border: '1px solid #7f1d1d', borderRadius: '4px', cursor: 'pointer', fontSize: '11px' }}
+          >
+            I waited 24h, clear lockout
+          </button>
+        </div>
+      )}
+
+      {/* Time-of-day warning */}
+      {mode === 'whatsapp' && settings.timeOfDayWarn && status === 'idle' && isOutsideBusinessHours() && (
+        <div style={{ background: '#fef7e0', color: '#8a6d3b', padding: '6px 16px', fontSize: '11px', borderBottom: '1px solid #f0d58c' }}>
+          Outside business hours (9am–9pm) — higher spam-detection risk. Consider waiting.
+        </div>
+      )}
+
+      {/* Cold-cap soft warning modal */}
+      {softCapModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100000 }}>
+          <div style={{ background: '#171717', border: '1px solid #ef4444', borderRadius: '8px', padding: '16px', maxWidth: '320px', color: '#fafafa' }}>
+            <div style={{ fontWeight: 700, color: '#ef4444', marginBottom: '8px' }}>Cold contact warning</div>
+            <div style={{ fontSize: '12px', color: '#a1a1aa', marginBottom: '12px' }}>
+              This job may send up to <b style={{ color: '#fafafa' }}>{softCapModal.coldCount}</b> messages. Industry-safe ceiling for cold/unsaved contacts is <b style={{ color: '#fafafa' }}>{softCapModal.cap}/day</b>. Sending more from a non-warmed-up number sharply increases ban risk.
+            </div>
+            <div style={{ fontSize: '11px', color: '#71717a', marginBottom: '12px' }}>
+              The actual cold count is shown after sending starts (warm contacts are exempt). Warm contacts will be sent first.
+            </div>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                onClick={() => { setSoftCapModal(null); }}
+                style={{ flex: 1, padding: '8px', background: '#262626', color: '#a1a1aa', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}
+              >Cancel</button>
+              <button
+                onClick={() => {
+                  setSoftCapModal(null);
+                  launchJob(mapContacts(contacts));
+                }}
+                style={{ flex: 1, padding: '8px', background: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '12px', fontWeight: 600 }}
+              >Send anyway</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Job header (warm/cold breakdown) */}
+      {mode === 'whatsapp' && jobHeader && (status === 'sending' || status === 'cooldown') && (
+        <div style={{ background: '#1f2937', color: '#a5b4fc', padding: '6px 16px', fontSize: '11px', borderBottom: '1px solid #262626' }}>
+          {jobHeader.warmCount} warm, {jobHeader.coldCount} cold (warm first) — cap {jobHeader.effectiveCap}{!jobHeader.warmupBypassed && ` (warmup day ${jobHeader.warmupDay})`}
+        </div>
+      )}
 
       {/* Error banner */}
       {errorBanner && (
@@ -300,6 +484,155 @@ export default function App() {
       )}
 
       <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+
+        {/* Extract Contacts (WhatsApp only) */}
+        {mode === 'whatsapp' && (() => {
+          const modeBtn = (m: ExtractMode, label: string) => (
+            <button
+              onClick={() => {
+                setExtractMode(m);
+                setExtracted([]);
+                setExtractMsg('');
+                setErrorBanner('');
+                if (m === 'pick-group' && groupList.length === 0 && !extracting) {
+                  setExtracting(true);
+                  window.parent.postMessage({ type: 'EXTRACT', mode: 'list-groups' }, '*');
+                }
+              }}
+              style={{
+                flex: 1, padding: '6px', fontSize: '12px', cursor: 'pointer',
+                background: extractMode === m ? '#10b981' : 'transparent',
+                color: extractMode === m ? '#fff' : '#a1a1aa',
+                border: '1px solid #262626', borderRadius: '6px',
+              }}
+            >{label}</button>
+          );
+
+          const startExtract = () => {
+            setErrorBanner('');
+            setExtractMsg('');
+            setExtracted([]);
+            setExtracting(true);
+            const payload: { type: string; mode: ExtractMode; groupId?: string } = { type: 'EXTRACT', mode: extractMode };
+            if (extractMode === 'pick-group') {
+              if (!pickedGroupId) {
+                setExtracting(false);
+                setErrorBanner('Pick a group from the dropdown first.');
+                return;
+              }
+              payload.groupId = pickedGroupId;
+            }
+            window.parent.postMessage(payload, '*');
+          };
+
+          const downloadCsv = () => {
+            if (extracted.length === 0) return;
+            const q = (v: string) => `"${(v ?? '').replace(/"/g, '""')}"`;
+            const enriched = extracted.map(r => {
+              const parsed = parsePhoneNumberFromString(r.phone);
+              const e164 = parsed?.isValid() ? parsed.number : r.phone;
+              return {
+                phone: e164,
+                country_code: parsed?.countryCallingCode ?? '',
+                country: parsed?.country ?? '',
+                national_number: parsed?.nationalNumber ?? '',
+                name: r.name || '',
+                source: r.source || '',
+              };
+            });
+            const header = 'phone,country_code,country,national_number,name,source';
+            const csv = '﻿' + header + '\n' + enriched.map(r =>
+              [r.phone, r.country_code, r.country, r.national_number, r.name, r.source].map(q).join(',')
+            ).join('\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            a.href = url;
+            a.download = `sendstack-${extractMode}-${stamp}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+          };
+
+          return (
+            <section>
+              <details open>
+                <summary style={{ fontWeight: 600, color: '#a1a1aa', cursor: 'pointer', marginBottom: '8px' }}>Extract Contacts</summary>
+
+                <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
+                  {modeBtn('current-group', 'Current Group')}
+                  {modeBtn('pick-group', 'Pick Group')}
+                  {modeBtn('all-chats', 'All Chats')}
+                </div>
+
+                {extractMode === 'pick-group' && (
+                  <select
+                    value={pickedGroupId}
+                    onChange={(e) => setPickedGroupId(e.target.value)}
+                    disabled={extracting || groupList.length === 0}
+                    style={{ width: '100%', padding: '6px', background: '#171717', color: '#fafafa', border: '1px solid #262626', borderRadius: '6px', fontSize: '12px', marginBottom: '8px' }}
+                  >
+                    <option value="">{groupList.length === 0 ? 'Loading groups…' : '— Select a group —'}</option>
+                    {groupList.map(g => (
+                      <option key={g.id} value={g.id}>{g.name}{g.size ? ` (${g.size})` : ''}</option>
+                    ))}
+                  </select>
+                )}
+
+                <button
+                  onClick={startExtract}
+                  disabled={extracting || (preflight !== null && !preflight.ready) || (extractMode === 'pick-group' && !pickedGroupId)}
+                  style={{ width: '100%', padding: '8px', background: extracting ? '#262626' : '#10b981', color: '#fff', border: 'none', borderRadius: '6px', cursor: extracting ? 'not-allowed' : 'pointer', fontSize: '13px', fontWeight: 600 }}
+                >
+                  {extracting ? 'Extracting…' : 'Extract Contacts'}
+                </button>
+
+                {extractMsg && (
+                  <div style={{ marginTop: '8px', fontSize: '12px', color: extracted.length > 0 ? '#fafafa' : '#71717a' }}>
+                    {extractMsg}
+                  </div>
+                )}
+
+                {extracted.length > 0 && (
+                  <>
+                    <div style={{ marginTop: '8px', maxHeight: '200px', overflowY: 'auto', border: '1px solid #262626', borderRadius: '6px', background: '#171717' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px' }}>
+                        <thead style={{ position: 'sticky', top: 0, background: '#171717' }}>
+                          <tr style={{ color: '#a1a1aa', textAlign: 'left' }}>
+                            <th style={{ padding: '6px 8px', borderBottom: '1px solid #262626', fontWeight: 600 }}>Name</th>
+                            <th style={{ padding: '6px 8px', borderBottom: '1px solid #262626', fontWeight: 600 }}>Phone</th>
+                            <th style={{ padding: '6px 8px', borderBottom: '1px solid #262626', fontWeight: 600 }}>Source</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {extracted.slice(0, 200).map((r, i) => (
+                            <tr key={i} style={{ borderBottom: '1px solid #262626' }}>
+                              <td style={{ padding: '4px 8px', color: '#fafafa', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name || '—'}</td>
+                              <td style={{ padding: '4px 8px', color: '#34d399', fontFamily: '"SF Mono", monospace' }}>{r.phone}</td>
+                              <td style={{ padding: '4px 8px', color: '#71717a', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.source}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {extracted.length > 200 && (
+                        <div style={{ padding: '6px 8px', fontSize: '11px', color: '#71717a', textAlign: 'center' }}>+ {extracted.length - 200} more rows in CSV</div>
+                      )}
+                    </div>
+
+                    <button
+                      onClick={downloadCsv}
+                      style={{ width: '100%', marginTop: '8px', padding: '8px', background: '#10b981', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}
+                    >
+                      Download CSV ({extracted.length} contacts)
+                    </button>
+                  </>
+                )}
+              </details>
+            </section>
+          );
+        })()}
 
         {/* CSV Upload */}
         <section>
@@ -388,11 +721,14 @@ export default function App() {
               <div>
                 <label style={{ fontSize: '12px', display: 'block', marginBottom: '2px', color: '#71717a' }}>Delay Preset</label>
                 <select value={settings.delayPreset} onChange={(e) => setSettings({ ...settings, delayPreset: e.target.value as ExtensionSettings['delayPreset'] })} style={{ width: '100%', padding: '4px', background: '#171717', color: '#fafafa', border: '1px solid #262626', borderRadius: '4px' }}>
-                  <option value="fast">Fast (5s)</option>
-                  <option value="normal">Normal (10s)</option>
-                  <option value="safe">Safe (15s)</option>
+                  <option value="stealth">Stealth — 90s base (lowest ban risk)</option>
+                  <option value="conversational">Conversational — 45s base (warm contacts)</option>
+                  <option value="fast">Fast — 20s base (high risk)</option>
                   <option value="custom">Custom</option>
                 </select>
+                <div style={{ fontSize: '11px', color: '#71717a', marginTop: '4px' }}>
+                  Cold contacts get 1.5× the base delay automatically.
+                </div>
               </div>
               {settings.delayPreset === 'custom' && (
                 <div>
@@ -420,6 +756,38 @@ export default function App() {
                 <input type="checkbox" id="spin" checked={settings.spinSyntaxEnabled} onChange={(e) => setSettings({ ...settings, spinSyntaxEnabled: e.target.checked })} />
                 <label htmlFor="spin" style={{ fontSize: '12px', color: '#a1a1aa' }}>Enable spin syntax {'{'+'A|B|C}'}</label>
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <input type="checkbox" id="zw" checked={settings.zeroWidthEnabled} onChange={(e) => setSettings({ ...settings, zeroWidthEnabled: e.target.checked })} />
+                <label htmlFor="zw" style={{ fontSize: '12px', color: '#a1a1aa' }} title="Inserts invisible zero-width characters between random words. Each message becomes byte-unique, defeating bulk-message detection.">Anti-fingerprint (zero-width chars)</label>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <input type="checkbox" id="typesim" checked={settings.typingSimulation} onChange={(e) => setSettings({ ...settings, typingSimulation: e.target.checked })} />
+                <label htmlFor="typesim" style={{ fontSize: '12px', color: '#a1a1aa' }} title="Types character-by-character at human speed instead of pasting instantly. Much harder to detect as automation, but slower per-message.">Simulate human typing (slower)</label>
+              </div>
+              <div style={{ borderTop: '1px solid #262626', paddingTop: '8px', marginTop: '4px' }}>
+                <div style={{ fontSize: '11px', color: '#a1a1aa', fontWeight: 600, marginBottom: '6px' }}>Anti-ban</div>
+                <div>
+                  <label style={{ fontSize: '12px', display: 'block', marginBottom: '2px', color: '#71717a' }}>Cold contact daily soft cap</label>
+                  <input type="number" min={5} max={500} value={settings.coldContactCap} onChange={(e) => setSettings({ ...settings, coldContactCap: Math.max(5, Number(e.target.value)) })} style={{ width: '100%', padding: '4px', background: '#171717', color: '#fafafa', border: '1px solid #262626', borderRadius: '4px' }} />
+                  <div style={{ fontSize: '11px', color: '#71717a', marginTop: '2px' }}>Industry-safe ceiling 50/day. Soft warning above this.</div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px' }}>
+                  <input type="checkbox" id="cls" checked={settings.classificationEnabled} onChange={(e) => setSettings({ ...settings, classificationEnabled: e.target.checked })} />
+                  <label htmlFor="cls" style={{ fontSize: '12px', color: '#a1a1aa' }} title="Look up each phone in your saved contacts + chat list before sending. Warm contacts go first; cold contacts get longer delays.">Classify warm vs cold contacts</label>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px' }}>
+                  <input type="checkbox" id="todw" checked={settings.timeOfDayWarn} onChange={(e) => setSettings({ ...settings, timeOfDayWarn: e.target.checked })} />
+                  <label htmlFor="todw" style={{ fontSize: '12px', color: '#a1a1aa' }} title="Show a warning banner if you start sending outside 9am-9pm local time.">Warn if outside business hours (9am–9pm)</label>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px' }}>
+                  <input type="checkbox" id="lta" checked={settings.longTermAccount} onChange={(e) => setSettings({ ...settings, longTermAccount: e.target.checked })} />
+                  <label htmlFor="lta" style={{ fontSize: '12px', color: '#a1a1aa' }} title="Bypass the 14-day warmup ramp. Only enable if this WhatsApp number has been actively used for 30+ days outside SendStack.">This number has been used 30+ days (skip warmup)</label>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px' }}>
+                  <input type="checkbox" id="pwp" checked={settings.prejobWarmupPing} onChange={(e) => setSettings({ ...settings, prejobWarmupPing: e.target.checked })} />
+                  <label htmlFor="pwp" style={{ fontSize: '12px', color: '#a1a1aa' }} title="Briefly opens a recent chat or two before the job starts so the session looks like normal usage.">Pre-job warmup ping (open recent chats)</label>
+                </div>
+              </div>
               <button
                 onClick={() => sendToBackground('SAVE_SETTINGS', settings as unknown as Record<string, unknown>).catch(() => setErrorBanner('Failed to save settings'))}
                 style={{ padding: '6px', background: '#10b981', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
@@ -434,10 +802,10 @@ export default function App() {
         <section style={{ display: 'flex', gap: '8px' }}>
           <button
             onClick={startJob}
-            disabled={status === 'sending' || status === 'cooldown' || (preflight !== null && !preflight.ready)}
-            style={{ flex: 1, padding: '10px', background: status === 'sending' ? '#262626' : '#10b981', color: '#fff', border: 'none', borderRadius: '8px', cursor: status === 'sending' ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '14px' }}
+            disabled={status === 'sending' || status === 'cooldown' || (preflight !== null && !preflight.ready) || (mode === 'whatsapp' && (banLock?.active ?? false))}
+            style={{ flex: 1, padding: '10px', background: status === 'sending' || (mode === 'whatsapp' && banLock?.active) ? '#262626' : '#10b981', color: '#fff', border: 'none', borderRadius: '8px', cursor: status === 'sending' || (mode === 'whatsapp' && banLock?.active) ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '14px' }}
           >
-            {status === 'sending' ? 'Sending...' : status === 'cooldown' ? `Cooldown ${cooldownRemaining}s` : 'Send Now'}
+            {mode === 'whatsapp' && banLock?.active ? 'Account locked' : status === 'sending' ? 'Sending...' : status === 'cooldown' ? `Cooldown ${cooldownRemaining}s` : 'Send Now'}
           </button>
           {(status === 'sending' || status === 'cooldown') && (
             <button onClick={cancelJob} style={{ padding: '10px 14px', background: '#ff3b30', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>Cancel</button>

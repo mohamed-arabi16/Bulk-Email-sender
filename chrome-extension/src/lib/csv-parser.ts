@@ -93,6 +93,35 @@ export function applyJitter(baseDelayMs: number): number {
   return Math.max(3000, Math.round(jittered));
 }
 
+/**
+ * Inject zero-width characters at random word boundaries.
+ * Visually identical to the recipient; byte-level unique per send.
+ * Defeats hash/dedup-based bulk-message detection.
+ */
+export function injectZeroWidth(text: string): string {
+  if (!text) return text;
+  const ZW = ['​', '‌']; // zero-width space, zero-width non-joiner
+  // Split keeping whitespace separators so we can inject between words
+  const parts = text.split(/(\s+)/);
+  if (parts.length < 3) {
+    // Short text — sprinkle 1 char in the middle
+    const mid = Math.floor(text.length / 2);
+    const ch = ZW[Math.floor(Math.random() * ZW.length)];
+    return text.slice(0, mid) + ch + text.slice(mid);
+  }
+  // Pick 2-4 random insertion points (between words, never at start/end)
+  const wordBoundaries: number[] = [];
+  for (let i = 1; i < parts.length - 1; i++) {
+    if (/^\s+$/.test(parts[i])) wordBoundaries.push(i);
+  }
+  const numInjections = Math.min(wordBoundaries.length, 2 + Math.floor(Math.random() * 3));
+  const chosen = new Set<number>();
+  while (chosen.size < numInjections && wordBoundaries.length > 0) {
+    chosen.add(wordBoundaries[Math.floor(Math.random() * wordBoundaries.length)]);
+  }
+  return parts.map((p, i) => chosen.has(i) ? p + ZW[Math.floor(Math.random() * ZW.length)] : p).join('');
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

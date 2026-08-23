@@ -5,6 +5,10 @@
 import type { ExtensionSettings, Job } from './lib/storage';
 import { getSettings, saveSettings, getDailyCount, incrementCount, resetCount } from './lib/storage';
 import type { Contact } from './lib/csv-parser';
+import {
+  getAccountProfile, recordSend, getEffectiveDailyCap,
+  markBanDetected, clearBanFlag, getBanLock,
+} from './lib/account';
 
 const jobs = new Map<string, Job>();
 
@@ -64,20 +68,10 @@ async function cancelWaJob(): Promise<void> {
 
 // Set default settings on install
 chrome.runtime.onInstalled.addListener(async () => {
+  // getSettings now merges with DEFAULT_SETTINGS so always returns a complete
+  // object. Persist it on first install to make defaults explicit in storage.
   const settings = await getSettings();
-  if (!settings) {
-    await saveSettings({
-      defaultMode: 'email',
-      delayPreset: 'normal',
-      customDelaySeconds: 10,
-      jitterEnabled: true,
-      batchSize: 10,
-      cooldownSeconds: 60,
-      dailyLimit: 200,
-      spinSyntaxEnabled: true,
-      sidebarPosition: 'right',
-    });
-  }
+  await saveSettings(settings);
   // Set up midnight reset alarm
   chrome.alarms.create('resetDailyCount', {
     when: nextMidnight(),
@@ -163,6 +157,33 @@ async function handleMessage(message: { action: string; payload?: Record<string,
       });
       return { ok: true };
     }
+    // ---- Anti-ban v2: account state ----
+    case 'GET_ACCOUNT_PROFILE':
+      return getAccountProfile();
+    case 'RECORD_SEND': {
+      const { warmth, success } = message.payload as { warmth: 'warm' | 'cold'; success: boolean };
+      await recordSend({ warmth, success });
+      return { ok: true };
+    }
+    case 'GET_WARMUP_STATE': {
+      const settings = await getSettings();
+      const cap = await getEffectiveDailyCap({
+        userDailyLimit: settings.dailyLimit,
+        longTermAccount: settings.longTermAccount,
+      });
+      const profile = await getAccountProfile();
+      return { ...cap, profile };
+    }
+    case 'MARK_BAN_DETECTED': {
+      const { reason } = message.payload as { reason: string };
+      await markBanDetected(reason);
+      return { ok: true };
+    }
+    case 'CLEAR_BAN_FLAG':
+      await clearBanFlag();
+      return { ok: true };
+    case 'GET_BAN_LOCK':
+      return getBanLock();
     default:
       return { error: `Unknown action: ${message.action}` };
   }

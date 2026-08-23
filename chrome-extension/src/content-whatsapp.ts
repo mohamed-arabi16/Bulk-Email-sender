@@ -1,11 +1,16 @@
-import { resolveTemplate, resolveSpin, applyJitter, sleep } from './lib/csv-parser';
+import { resolveTemplate, resolveSpin, applyJitter, sleep, injectZeroWidth } from './lib/csv-parser';
 import type { Contact } from './lib/csv-parser';
 import { sendToBackground } from './lib/messaging';
-import type { ExtensionSettings } from './lib/storage';
+import type { ExtensionSettings, AccountProfile } from './lib/storage';
 import type { WaJobState } from './background';
 import { findElement, findSelector, runPreflight, SelectorError, WHATSAPP_SELECTORS } from './lib/selectors';
-import { CIRCUIT_BREAKER_THRESHOLD, RETRY_ATTEMPTS, RETRY_BACKOFF_MS, isRetryableError } from './lib/circuit-breaker';
-import { initBridge, openChat, isBridgeReady } from './lib/wa-api';
+import {
+  CIRCUIT_BREAKER_THRESHOLD, RETRY_ATTEMPTS, RETRY_BACKOFF_MS, isRetryableError,
+  CONSECUTIVE_ACK_FAILURE_THRESHOLD, ACK_FAILURE_WINDOW, MIN_ACK_RATE, isBanLikeError,
+} from './lib/circuit-breaker';
+import { initBridge, openChat, sendText, isBridgeReady, extractCurrentGroup, extractPickedGroup, extractAllChats, listGroups, WaSendError } from './lib/wa-api';
+import { classifyRecipients, partitionByWarmth, warmthOf, normalizePhone } from './lib/classifier';
+import type { Warmth } from './lib/classifier';
 
 let panelVisible = false;
 let shadowHost: HTMLDivElement | null = null;
@@ -125,28 +130,108 @@ function togglePanel() {
 
 // ---- In-page job loop (no reload) ----
 
+/**
+ * Map a delay preset to a base delay in ms.
+ * Stealth: 90s base. Conversational: 45s. Fast: 20s. Custom: user value.
+ * Old preset names (fast/normal/safe) are mapped for backwards-compat.
+ */
+function baseDelayFor(settings: ExtensionSettings): number {
+  switch (settings.delayPreset) {
+    case 'stealth': return 90000;
+    case 'conversational': return 45000;
+    case 'fast': return 20000;
+    case 'custom': return Math.max(3, settings.customDelaySeconds) * 1000;
+    // Legacy presets — should be migrated, but handle defensively
+    case 'normal': return 90000; // map to stealth
+    case 'safe': return 90000;
+    default: return 90000;
+  }
+}
+
+/**
+ * Per-recipient delay multiplier. Cold contacts wait 1.5x as long as warm —
+ * front-loads warm "real conversation" signals and slows down the riskier sends.
+ */
+function delayForWarmth(base: number, warmth: Warmth): number {
+  return warmth === 'warm' ? base : Math.round(base * 1.5);
+}
+
 async function runWaJob(contacts: Contact[], template: string, settings: ExtensionSettings): Promise<void> {
   cancelRequested = false;
-  const total = contacts.length;
+
+  // ---- Step 0: Ban-lock guard. Refuse to run if account was flagged ban-locked. ----
+  try {
+    const lock = await sendToBackground<{ active: boolean; remainingMs: number; reason: string }>('GET_BAN_LOCK');
+    if (lock?.active) {
+      const hours = Math.ceil(lock.remainingMs / (60 * 60 * 1000));
+      postJobComplete(0, 0, 0, true,
+        `Account is locked from sending (~${hours}h remaining). Last signal: ${lock.reason || 'ban-like behavior'}.`);
+      return;
+    }
+  } catch { /* non-fatal */ }
+
+  // ---- Step 1: Classify warm vs cold (if enabled) ----
+  let classification: Map<string, Warmth>;
+  if (settings.classificationEnabled && isBridgeReady()) {
+    try {
+      const phones = contacts.map(c => c.phone ?? '').filter(Boolean);
+      classification = await classifyRecipients(phones);
+    } catch (err) {
+      console.warn('[SendStack] Classification failed, treating all as cold:', err);
+      classification = new Map();
+    }
+  } else {
+    classification = new Map();
+  }
+
+  // ---- Step 2: Reorder so warm contacts go first ----
+  const { ordered, warmCount, coldCount } = partitionByWarmth(contacts, classification);
+  const orderedQueue = settings.classificationEnabled ? ordered : contacts;
+  const total = orderedQueue.length;
+  console.log(`[SendStack] Job: ${warmCount} warm, ${coldCount} cold (warm first)`);
+
+  // ---- Step 3: Pull warmup state for daily-cap enforcement ----
+  let effectiveCap = settings.dailyLimit;
+  let warmupBypassed = false;
+  let warmupDay = 1;
+  try {
+    const ws = await sendToBackground<{ cap: number; warmupDay: number; bypassed: boolean }>('GET_WARMUP_STATE');
+    if (ws) {
+      effectiveCap = ws.cap;
+      warmupBypassed = ws.bypassed;
+      warmupDay = ws.warmupDay;
+    }
+  } catch { /* fall back to user limit */ }
+
+  postToPanel({
+    type: 'JOB_HEADER',
+    warmCount, coldCount, total,
+    effectiveCap, warmupDay, warmupBypassed,
+  });
+
   let sent = 0, failed = 0, skipped = 0, consecutiveFailures = 0;
+  let consecutiveAckFailures = 0;
+  // Rolling ack-success window
+  const ackWindow: boolean[] = [];
 
-  const delayMap: Record<string, number> = { fast: 5000, normal: 10000, safe: 15000 };
-  const baseDelay = settings.delayPreset === 'custom'
-    ? settings.customDelaySeconds * 1000
-    : (delayMap[settings.delayPreset] ?? 10000);
+  const baseDelay = baseDelayFor(settings);
 
-  for (let i = 0; i < contacts.length; i++) {
+  for (let i = 0; i < orderedQueue.length; i++) {
     if (cancelRequested) break;
 
-    const contact = contacts[i];
+    const contact = orderedQueue[i];
     const phone = contact.phone ?? '';
+    const warmth = warmthOf(phone, classification);
 
-    // Enforce daily limit
-    const { sent: dailySent, limit: dailyLimit } =
+    // Enforce effective daily cap (warmup ∩ user limit)
+    const { sent: dailySent } =
       await sendToBackground<{ sent: number; limit: number }>('GET_DAILY_COUNT');
-    if (dailySent >= dailyLimit) {
+    if (dailySent >= effectiveCap) {
       skipped++;
-      postProgress(i + 1, total, sent, failed, 'skipped', phone, 'Daily limit reached');
+      const reason = warmupBypassed
+        ? 'Daily limit reached'
+        : `Warmup cap reached (day ${warmupDay} of 14, cap ${effectiveCap})`;
+      postProgress(i + 1, total, sent, failed, 'skipped', phone, reason);
       break;
     }
 
@@ -158,23 +243,61 @@ async function runWaJob(contacts: Contact[], template: string, settings: Extensi
 
     let resolvedMsg = resolveTemplate(template, contact);
     if (settings.spinSyntaxEnabled) resolvedMsg = resolveSpin(resolvedMsg);
+    if (settings.zeroWidthEnabled) resolvedMsg = injectZeroWidth(resolvedMsg);
 
+    let sendOk = false;
     try {
-      // Open chat via WA-JS API (no page reload)
+      // Open chat for visual feedback. Variable latency so it doesn't look robotic.
       await openChat(phone);
-      // Wait for compose box to appear
-      await sleep(1000);
-      // Send message via DOM automation (natural user behavior)
-      await withRetry(() => doSendInOpenChat(resolvedMsg));
+      const lookLatency = 2000 + Math.floor(Math.random() * 6000); // 2-8s
+      await sleep(lookLatency);
+
+      await withRetry(() => sendText(phone, resolvedMsg, settings.typingSimulation));
+      sendOk = true;
       sent++;
       consecutiveFailures = 0;
+      consecutiveAckFailures = 0;
       await sendToBackground('INCREMENT_COUNT', { n: 1 });
+      await sendToBackground('RECORD_SEND', { warmth, success: true });
       postProgress(i + 1, total, sent, failed, 'success', phone);
     } catch (err) {
       failed++;
       consecutiveFailures++;
-      postProgress(i + 1, total, sent, failed, 'error', phone, String(err));
+      const isBanLike = isBanLikeError(err);
+      if (isBanLike) consecutiveAckFailures++;
+      else consecutiveAckFailures = 0;
 
+      const code = err instanceof WaSendError ? err.code : '';
+      postProgress(i + 1, total, sent, failed, 'error', phone,
+        code ? `${code}: ${err instanceof Error ? err.message : String(err)}` : String(err));
+
+      // Trigger 1: Consecutive ack-failure threshold = ban-like signal
+      if (consecutiveAckFailures >= CONSECUTIVE_ACK_FAILURE_THRESHOLD) {
+        const reason = `${consecutiveAckFailures} consecutive ${code} errors — account likely restricted`;
+        await sendToBackground('MARK_BAN_DETECTED', { reason });
+        postJobComplete(sent, failed, total - sent - failed - skipped, true,
+          `Account paused — ${reason}. Send re-enabled in 24h.`);
+        notifyError(`Account paused after ${sent}/${total} sent. ${reason}.`);
+        return;
+      }
+
+      // Trigger 2: Rolling ack-rate falls below threshold
+      ackWindow.push(false);
+      if (ackWindow.length > ACK_FAILURE_WINDOW) ackWindow.shift();
+      if (ackWindow.length >= ACK_FAILURE_WINDOW) {
+        const successCount = ackWindow.filter(Boolean).length;
+        const rate = successCount / ackWindow.length;
+        if (rate < MIN_ACK_RATE) {
+          const reason = `Send-success rate dropped to ${(rate * 100).toFixed(0)}% over last ${ACK_FAILURE_WINDOW} sends`;
+          await sendToBackground('MARK_BAN_DETECTED', { reason });
+          postJobComplete(sent, failed, total - sent - failed - skipped, true,
+            `Account paused — ${reason}. Send re-enabled in 24h.`);
+          notifyError(`Account paused after ${sent}/${total}. ${reason}.`);
+          return;
+        }
+      }
+
+      // Trigger 3: Existing circuit breaker on consecutive failures (any kind)
       if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
         const errorMsg = err instanceof SelectorError
           ? `${err.selectorName} not found — WhatsApp UI may have changed`
@@ -184,50 +307,32 @@ async function runWaJob(contacts: Contact[], template: string, settings: Extensi
         notifyError(`Job halted after ${sent}/${total} — ${errorMsg}`);
         return;
       }
+
+      await sendToBackground('RECORD_SEND', { warmth, success: false });
     }
 
-    // Inter-message delay
-    if ((i + 1) % settings.batchSize === 0 && i + 1 < contacts.length) {
-      postCooldown(settings.cooldownSeconds);
-      await sleep(settings.cooldownSeconds * 1000);
-    } else if (i + 1 < contacts.length) {
-      const delay = settings.jitterEnabled ? applyJitter(baseDelay) : baseDelay;
-      await sleep(delay);
+    // Track success in rolling window
+    if (sendOk) {
+      ackWindow.push(true);
+      if (ackWindow.length > ACK_FAILURE_WINDOW) ackWindow.shift();
+    }
+
+    // Inter-message delay (warmth-aware) + optional batch cooldown
+    if (i + 1 < orderedQueue.length) {
+      const isBatchBoundary = settings.batchSize > 0
+        && (i + 1) % settings.batchSize === 0;
+      if (isBatchBoundary && settings.cooldownSeconds > 0) {
+        postCooldown(settings.cooldownSeconds);
+        await sleep(settings.cooldownSeconds * 1000);
+      } else {
+        const perRecipient = delayForWarmth(baseDelay, warmth);
+        const delay = settings.jitterEnabled ? applyJitter(perRecipient) : perRecipient;
+        await sleep(delay);
+      }
     }
   }
 
   postJobComplete(sent, failed, total - sent - failed - skipped);
-}
-
-// ---- Send message in already-open chat (DOM automation) ----
-
-async function doSendInOpenChat(message: string): Promise<void> {
-  const msgInputDef = findSelector('MSG_INPUT', WHATSAPP_SELECTORS);
-  const input = await findElement(msgInputDef, 8000) as HTMLElement;
-
-  input.focus();
-  document.execCommand('insertText', false, message);
-  input.dispatchEvent(new InputEvent('input', {
-    inputType: 'insertText',
-    data: message,
-    bubbles: true,
-    cancelable: true,
-  }));
-  await sleep(300);
-
-  const sendBtnDef = findSelector('SEND_BUTTON', WHATSAPP_SELECTORS);
-  let sendBtn: Element | null = null;
-  for (const sel of sendBtnDef.selectors) {
-    sendBtn = document.querySelector(sel);
-    if (sendBtn) break;
-  }
-  if (sendBtn) {
-    (sendBtn as HTMLElement).click();
-  } else {
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-  }
-
-  await sleep(500);
 }
 
 // ---- Legacy: URL-based flow (fallback + resume) ----
@@ -255,9 +360,10 @@ async function processCurrentContact(): Promise<void> {
 
   let resolvedMsg = resolveTemplate(job.template, contact);
   if (job.settings.spinSyntaxEnabled) resolvedMsg = resolveSpin(resolvedMsg);
+  if (job.settings.zeroWidthEnabled) resolvedMsg = injectZeroWidth(resolvedMsg);
 
   try {
-    await withRetry(() => doSendOnLegacyPage(phone, resolvedMsg));
+    await withRetry(() => doSendOnLegacyPage(phone, resolvedMsg, job.settings.typingSimulation));
     sent++;
     consecutiveFailures = 0;
     await sendToBackground('INCREMENT_COUNT', { n: 1 });
@@ -288,10 +394,7 @@ async function processCurrentContact(): Promise<void> {
   if (nextIndex % batchSize === 0) {
     await sleep(job.settings.cooldownSeconds * 1000);
   } else {
-    const delayMap: Record<string, number> = { fast: 5000, normal: 10000, safe: 15000 };
-    const base = job.settings.delayPreset === 'custom'
-      ? job.settings.customDelaySeconds * 1000
-      : (delayMap[job.settings.delayPreset] ?? 10000);
+    const base = baseDelayFor(job.settings);
     const delay = job.settings.jitterEnabled ? applyJitter(base) : base;
     await sleep(delay);
   }
@@ -303,7 +406,7 @@ async function processCurrentContact(): Promise<void> {
   }
 }
 
-async function doSendOnLegacyPage(phone: string, message: string): Promise<void> {
+async function doSendOnLegacyPage(phone: string, message: string, _simulateTyping: boolean): Promise<void> {
   const msgInputDef = findSelector('MSG_INPUT', WHATSAPP_SELECTORS);
   const input = await findElement(msgInputDef, 20000) as HTMLElement;
 
@@ -317,13 +420,27 @@ async function doSendOnLegacyPage(phone: string, message: string): Promise<void>
   }
 
   input.focus();
-  document.execCommand('insertText', false, message);
-  input.dispatchEvent(new InputEvent('input', {
-    inputType: 'insertText',
-    data: message,
-    bubbles: true,
-    cancelable: true,
-  }));
+  // Split on newlines: paste each line, then Shift+Enter for line break.
+  // execCommand('insertText', '\n') in WhatsApp's contenteditable triggers
+  // send (Enter is "send"), so we MUST simulate Shift+Enter for newlines.
+  const lines = message.split('\n');
+  for (let li = 0; li < lines.length; li++) {
+    if (lines[li]) {
+      document.execCommand('insertText', false, lines[li]);
+      input.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertText', data: lines[li], bubbles: true, cancelable: true,
+      }));
+    }
+    if (li < lines.length - 1) {
+      // Shift+Enter for line break
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }));
+      document.execCommand('insertLineBreak');
+      input.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertLineBreak', bubbles: true, cancelable: true,
+      }));
+    }
+    await sleep(50);
+  }
   await sleep(300);
 
   const sendBtnDef = findSelector('SEND_BUTTON', WHATSAPP_SELECTORS);
@@ -373,6 +490,29 @@ async function handlePanelMessage(event: MessageEvent) {
   } else if (data.type === 'CANCEL_JOB') {
     cancelRequested = true;
     sendToBackground('CANCEL_WA_JOB', {}).catch((err) => notifyError(String(err)));
+  } else if (data.type === 'EXTRACT') {
+    if (!isBridgeReady()) {
+      postToPanel({ type: 'EXTRACT_RESULT', success: false, error: 'WA-JS bridge not ready — reload WhatsApp Web and try again' });
+      return;
+    }
+    const mode = data.mode as 'current-group' | 'list-groups' | 'pick-group' | 'all-chats';
+    const groupId = data.groupId as string | undefined;
+    try {
+      if (mode === 'list-groups') {
+        const groups = await listGroups();
+        postToPanel({ type: 'EXTRACT_RESULT', mode, success: true, groups });
+      } else if (mode === 'all-chats') {
+        const contacts = await extractAllChats();
+        postToPanel({ type: 'EXTRACT_RESULT', mode, success: true, contacts });
+      } else {
+        const r = mode === 'current-group'
+          ? await extractCurrentGroup()
+          : await extractPickedGroup(groupId ?? '');
+        postToPanel({ type: 'EXTRACT_RESULT', mode, success: true, contacts: r.contacts, unresolved: r.unresolved, total: r.total });
+      }
+    } catch (err) {
+      postToPanel({ type: 'EXTRACT_RESULT', mode, success: false, error: String(err instanceof Error ? err.message : err) });
+    }
   }
 }
 

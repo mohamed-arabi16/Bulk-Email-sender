@@ -11,6 +11,7 @@
   "dependencies": {
     "@wppconnect/wa-js": "^3.23.2",
     "dompurify": "^3.2.5",
+    "libphonenumber-js": "^1.12.42",
     "papaparse": "^5.5.3",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
